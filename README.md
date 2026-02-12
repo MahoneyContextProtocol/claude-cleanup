@@ -57,6 +57,7 @@ When many tools and MCP connectors are enabled, they consume the context window 
 ```
 claude-cleanup/
 ├── claude-cleanup.sh        # Main cleanup script (bash, cross-platform)
+├── SKILL.md                 # Claude Skill — teaches Claude to fix context issues
 ├── README.md                # This file
 ├── LICENSE                  # MIT License
 ├── .gitignore               # Excludes backups/ and .DS_Store
@@ -235,6 +236,71 @@ sequenceDiagram
     U->>S: claude-fix restore
     S->>FS: Copy latest .bak → original config paths
     S->>U: Done — restart apps for changes
+```
+
+## Claude Skill
+
+This repo includes a Claude Skill (`SKILL.md`) that teaches any Claude instance how to diagnose and fix context window exhaustion — no script install required.
+
+### What the Skill Does
+
+```mermaid
+graph LR
+    subgraph "Skill Capabilities"
+        A[Diagnose] -->|identifies| A1[MCP server count]
+        A -->|identifies| A2[Token-heavy features]
+        B[Fix — Automated] -->|guides| B1[Script install + nuke]
+        C[Fix — Manual] -->|walks through| C1[UI toggle checklist]
+        D[Re-enable] -->|strategy| D1[One-at-a-time testing]
+        E[Troubleshoot] -->|resolves| E1[Common post-fix issues]
+    end
+
+    style A fill:#4ecdc4,color:#fff
+    style B fill:#45b7d1,color:#fff
+    style C fill:#ff9f43,color:#fff
+    style D fill:#4ecdc4,color:#fff
+    style E fill:#ff6b6b,color:#fff
+```
+
+### Install as Custom Skill
+
+**Option A — Claude Projects (claude.ai):**
+1. Create a new Project (or open an existing one)
+2. Add `SKILL.md` to Project Knowledge
+3. Any conversation in that project now knows how to fix context issues
+
+**Option B — Claude Code / Claude Desktop (local skill):**
+```bash
+# Create the skill directory
+mkdir -p ~/.claude/skills/claude-context-cleanup
+
+# Copy the skill file
+cp ~/claude-cleanup/SKILL.md ~/.claude/skills/claude-context-cleanup/SKILL.md
+```
+
+**Option C — Share the `.skill` package:**
+
+Download `claude-context-cleanup.skill` from [Releases](https://github.com/MahoneyContextProtocol/claude-cleanup/releases) and import it into any Claude instance that supports custom skills.
+
+### Skill + Script Together
+
+The skill knows about the script. If the script is installed, the skill guides users to run `claude-fix` commands. If not, it walks through manual diagnosis and fix steps. Either way works.
+
+```mermaid
+graph TD
+    S[Skill detects context issue] --> Q{Script installed?}
+    Q -->|Yes| A["Guide: claude-fix nuke -y"]
+    Q -->|No| B[Walk through manual steps]
+    A --> M[Remind: manual UI toggles]
+    B --> M
+    M --> T[Test in new chat]
+    T --> R{Working?}
+    R -->|Yes| E["Re-enable one at a time"]
+    R -->|No| F[Escalate to Anthropic support]
+
+    style A fill:#4ecdc4,color:#fff
+    style B fill:#ff9f43,color:#fff
+    style M fill:#ff6b6b,color:#fff
 ```
 
 ## Background
