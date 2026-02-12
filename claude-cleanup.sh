@@ -85,6 +85,8 @@ show_help() {
     echo ""
     echo "Commands:"
     echo "  status       Show config state, MCP count, and cache sizes"
+    echo "  doctor       Estimate token usage per connector, recommend cuts"
+    echo "  slim         Disable heaviest connectors, keep lightweight ones"
     echo "  disable      Backup configs, then disable all MCP servers"
     echo "  restore      Restore configs from most recent backup"
     echo "  cache        Clear Claude-related caches"
@@ -93,12 +95,13 @@ show_help() {
     echo "  help         Show this help message"
     echo ""
     echo "Flags:"
-    echo "  -y, --yes    Skip confirmation prompts (for nuke)"
+    echo "  -y, --yes    Skip confirmation prompts (for nuke, slim)"
     echo ""
     echo "Examples:"
-    echo "  ./claude-cleanup.sh nuke -y    # One-shot full cleanup, no prompts"
-    echo "  ./claude-cleanup.sh status     # Check current state"
-    echo "  ./claude-cleanup.sh restore    # Undo after testing"
+    echo "  ./claude-cleanup.sh doctor       # See what's eating your context"
+    echo "  ./claude-cleanup.sh slim -y      # Cut the heavy stuff, keep the rest"
+    echo "  ./claude-cleanup.sh nuke -y      # Nuclear option — disable everything"
+    echo "  ./claude-cleanup.sh restore      # Bring it all back"
     echo ""
 }
 
@@ -365,12 +368,345 @@ cmd_manual() {
     echo ""
 }
 
+# ── DOCTOR ───────────────────────────────────────────────────────────────────
+
+cmd_doctor() {
+    echo -e "${CYAN}▸ Context Window Doctor${NC}"
+    echo -e "  Estimating token usage across all configs..."
+    echo ""
+
+    python3 << 'PYEOF'
+import json, os, sys
+
+CONTEXT_WINDOW = 200000
+
+# Token cost estimates per tool definition complexity
+# Based on typical MCP server schema sizes
+HEAVY_KEYWORDS = {
+    "playwright": 8000, "browser": 7000, "puppeteer": 7000,
+    "selenium": 7000, "brightdata": 6000, "hyperbrowser": 6000,
+    "cloudflare": 5000, "supabase": 5000, "firebase": 5000,
+    "notion": 4000, "github": 4000, "gitlab": 4000,
+    "jira": 4000, "atlassian": 4000, "clickup": 4000,
+    "salesforce": 5000, "hubspot": 4000, "airtable": 3500,
+    "zapier": 4000, "n8n": 4000, "pipedream": 4000,
+    "slack": 3500, "discord": 3500, "telegram": 3000,
+    "gmail": 3500, "outlook": 3500, "email": 3000,
+    "figma": 4000, "canva": 3500, "miro": 3500,
+    "youtube": 3000, "twitter": 3000, "linkedin": 3000,
+    "search": 3000, "exa": 3000, "tavily": 3000, "kagi": 3000,
+    "context7": 2500, "memory": 2000, "supermemory": 2500,
+}
+
+DEFAULT_ESTIMATE = 3000  # tokens per unknown MCP server
+LIGHTWEIGHT_THRESHOLD = 3000  # tokens — below this is "lightweight"
+
+# Fixed feature costs (cloud-side, not in configs but for the report)
+CLOUD_FEATURES = {
+    "Web Search": 8000,
+    "Extended Thinking": 8000,
+    "Analysis Tool": 15000,
+    "Code Execution": 8000,
+    "Artifacts": 3000,
+}
+
+configs = [
+    os.path.expanduser("~/Library/Application Support/Claude/claude_desktop_config.json"),
+    os.path.expanduser("~/.config/Claude/claude_desktop_config.json"),
+    os.path.expanduser("~/.claude/settings.json"),
+    os.path.expanduser("~/.claude/mcp.json"),
+]
+
+all_servers = {}  # name -> {path, estimated_tokens, heavy}
+
+for config_path in configs:
+    if not os.path.isfile(config_path):
+        continue
+    try:
+        with open(config_path) as f:
+            data = json.load(f)
+        for key in ["mcpServers", "mcp_servers"]:
+            if key in data:
+                for name, conf in data[key].items():
+                    # Estimate tokens based on server name/type
+                    tokens = DEFAULT_ESTIMATE
+                    name_lower = name.lower()
+                    for keyword, cost in HEAVY_KEYWORDS.items():
+                        if keyword in name_lower:
+                            tokens = cost
+                            break
+                    # Check if config has many tools defined (heavier)
+                    if isinstance(conf, dict):
+                        tools = conf.get("tools", [])
+                        if len(tools) > 5:
+                            tokens = int(tokens * 1.5)
+                    all_servers[name] = {
+                        "path": os.path.basename(config_path),
+                        "tokens": tokens,
+                        "heavy": tokens >= LIGHTWEIGHT_THRESHOLD,
+                    }
+    except Exception:
+        pass
+
+if not all_servers:
+    print("  No MCP servers found in any config files.")
+    print("  Your local configs are clean — check cloud connectors at claude.ai/settings/capabilities")
+    sys.exit(0)
+
+# Sort by token cost descending
+sorted_servers = sorted(all_servers.items(), key=lambda x: x[1]["tokens"], reverse=True)
+
+total_mcp_tokens = sum(s["tokens"] for _, s in sorted_servers)
+heavy_servers = [(n, s) for n, s in sorted_servers if s["heavy"]]
+light_servers = [(n, s) for n, s in sorted_servers if not s["heavy"]]
+
+# Cloud features estimate
+total_cloud = sum(CLOUD_FEATURES.values())
+
+# Print report
+print("\033[0;36m  ┌─────────────────────────────────────────────────────────────┐\033[0m")
+print("\033[0;36m  │            CONTEXT WINDOW USAGE ESTIMATE                    │\033[0m")
+print("\033[0;36m  └─────────────────────────────────────────────────────────────┘\033[0m")
+print()
+
+# Bar chart
+mcp_pct = (total_mcp_tokens / CONTEXT_WINDOW) * 100
+cloud_pct = (total_cloud / CONTEXT_WINDOW) * 100
+remaining_pct = max(0, 100 - mcp_pct - cloud_pct)
+remaining_tokens = max(0, CONTEXT_WINDOW - total_mcp_tokens - total_cloud)
+
+bar_width = 50
+mcp_bars = int(bar_width * mcp_pct / 100)
+cloud_bars = int(bar_width * cloud_pct / 100)
+remaining_bars = bar_width - mcp_bars - cloud_bars
+
+print(f"  200K Context Window:")
+print(f"  \033[0;31m{'█' * mcp_bars}\033[0;33m{'█' * cloud_bars}\033[0;32m{'░' * remaining_bars}\033[0m")
+print(f"  \033[0;31m■\033[0m MCP Servers: ~{total_mcp_tokens:,} tokens ({mcp_pct:.0f}%)")
+print(f"  \033[0;33m■\033[0m Cloud Features*: ~{total_cloud:,} tokens ({cloud_pct:.0f}%)")
+print(f"  \033[0;32m░\033[0m Available: ~{remaining_tokens:,} tokens ({remaining_pct:.0f}%)")
+print(f"  \033[0;90m  *if all enabled — Web Search, Thinking, Analysis, Code Exec, Artifacts\033[0m")
+print()
+
+if remaining_pct < 25:
+    print(f"  \033[0;31m⚠ CRITICAL: Less than 25% context remaining for conversation!\033[0m")
+elif remaining_pct < 50:
+    print(f"  \033[1;33m⚠ WARNING: Less than 50% context available.\033[0m")
+else:
+    print(f"  \033[0;32m✓ Context usage looks manageable.\033[0m")
+print()
+
+# Per-server breakdown
+print(f"\033[0;36m  ▸ MCP Servers ({len(all_servers)} total, ~{total_mcp_tokens:,} tokens)\033[0m")
+print()
+
+if heavy_servers:
+    print(f"  \033[0;31m  Heavy (>{LIGHTWEIGHT_THRESHOLD} tokens each):\033[0m")
+    for name, info in heavy_servers:
+        bar = "█" * min(20, info["tokens"] // 500)
+        print(f"    \033[0;31m{bar}\033[0m {info['tokens']:>5,}t  {name} ({info['path']})")
+    print()
+
+if light_servers:
+    print(f"  \033[0;32m  Lightweight (<={LIGHTWEIGHT_THRESHOLD} tokens each):\033[0m")
+    for name, info in light_servers:
+        bar = "░" * min(20, info["tokens"] // 500)
+        print(f"    \033[0;32m{bar}\033[0m {info['tokens']:>5,}t  {name} ({info['path']})")
+    print()
+
+# Recommendations
+print(f"\033[0;36m  ▸ Recommendations\033[0m")
+print()
+
+if len(heavy_servers) > 0 and remaining_pct < 50:
+    savings = sum(s["tokens"] for _, s in heavy_servers)
+    new_remaining = remaining_tokens + savings
+    new_pct = (new_remaining / CONTEXT_WINDOW) * 100
+    print(f"  1. Disable {len(heavy_servers)} heavy server(s) to free ~{savings:,} tokens")
+    print(f"     → Context available would increase from {remaining_pct:.0f}% to {new_pct:.0f}%")
+    print(f"     Run: \033[0;36mclaude-fix slim -y\033[0m")
+    print()
+
+if len(all_servers) > 10:
+    print(f"  2. You have {len(all_servers)} MCP servers — consider keeping only daily-use ones")
+    print(f"     Enable others on-demand when needed")
+    print()
+
+print(f"  3. Check cloud connectors at claude.ai/settings/capabilities")
+print(f"     Those add tokens too but aren't in local config files")
+print()
+
+PYEOF
+
+    echo ""
+}
+
+# ── SLIM ────────────────────────────────────────────────────────────────────
+
+cmd_slim() {
+    local skip_confirm=false
+    [[ "${2:-}" == "-y" || "${2:-}" == "--yes" ]] && skip_confirm=true
+
+    echo -e "${CYAN}▸ Slim Mode — disable heavy connectors, keep lightweight ones${NC}"
+    echo ""
+
+    # First show what will happen
+    python3 << 'PYEOF'
+import json, os, sys
+
+HEAVY_KEYWORDS = {
+    "playwright": 8000, "browser": 7000, "puppeteer": 7000,
+    "selenium": 7000, "brightdata": 6000, "hyperbrowser": 6000,
+    "cloudflare": 5000, "supabase": 5000, "firebase": 5000,
+    "notion": 4000, "github": 4000, "gitlab": 4000,
+    "jira": 4000, "atlassian": 4000, "clickup": 4000,
+    "salesforce": 5000, "hubspot": 4000, "airtable": 3500,
+    "zapier": 4000, "n8n": 4000, "pipedream": 4000,
+    "slack": 3500, "discord": 3500, "telegram": 3000,
+    "gmail": 3500, "outlook": 3500, "email": 3000,
+    "figma": 4000, "canva": 3500, "miro": 3500,
+    "youtube": 3000, "twitter": 3000, "linkedin": 3000,
+    "search": 3000, "exa": 3000, "tavily": 3000, "kagi": 3000,
+    "context7": 2500, "memory": 2000, "supermemory": 2500,
+}
+DEFAULT_ESTIMATE = 3000
+LIGHTWEIGHT_THRESHOLD = 3000
+
+configs = [
+    os.path.expanduser("~/Library/Application Support/Claude/claude_desktop_config.json"),
+    os.path.expanduser("~/.config/Claude/claude_desktop_config.json"),
+    os.path.expanduser("~/.claude/settings.json"),
+    os.path.expanduser("~/.claude/mcp.json"),
+]
+
+heavy_count = 0
+light_count = 0
+heavy_names = []
+
+for config_path in configs:
+    if not os.path.isfile(config_path):
+        continue
+    try:
+        with open(config_path) as f:
+            data = json.load(f)
+        for key in ["mcpServers", "mcp_servers"]:
+            if key in data:
+                for name in data[key]:
+                    tokens = DEFAULT_ESTIMATE
+                    name_lower = name.lower()
+                    for keyword, cost in HEAVY_KEYWORDS.items():
+                        if keyword in name_lower:
+                            tokens = cost
+                            break
+                    if tokens >= LIGHTWEIGHT_THRESHOLD:
+                        heavy_count += 1
+                        heavy_names.append(name)
+                    else:
+                        light_count += 1
+    except Exception:
+        pass
+
+if heavy_count == 0:
+    print("  No heavy connectors found — your config is already slim.")
+    sys.exit(1)
+
+print(f"  Will DISABLE {heavy_count} heavy connector(s): {', '.join(heavy_names)}")
+print(f"  Will KEEP {light_count} lightweight connector(s)")
+PYEOF
+
+    local preview_exit=$?
+    if [[ $preview_exit -eq 1 ]]; then
+        return 0
+    fi
+
+    echo ""
+
+    if ! $skip_confirm; then
+        read -p "  Proceed? [y/N] " -n 1 -r
+        echo ""
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "  Aborted."
+            return 0
+        fi
+    fi
+
+    # Backup first
+    mkdir -p "$BACKUP_DIR"
+
+    for config_path in "$CLAUDE_DESKTOP_CONFIG" "$CLAUDE_CODE_CONFIG" "$CLAUDE_MCP_CONFIG"; do
+        if [[ -f "$config_path" ]]; then
+            label=$(basename "$config_path")
+            backup_file="$BACKUP_DIR/${label}.${TIMESTAMP}.bak"
+            cp "$config_path" "$backup_file"
+            echo -e "  ${GREEN}✓${NC} Backed up: $label"
+
+            python3 -c "
+import json, sys
+
+HEAVY_KEYWORDS = {
+    'playwright': 8000, 'browser': 7000, 'puppeteer': 7000,
+    'selenium': 7000, 'brightdata': 6000, 'hyperbrowser': 6000,
+    'cloudflare': 5000, 'supabase': 5000, 'firebase': 5000,
+    'notion': 4000, 'github': 4000, 'gitlab': 4000,
+    'jira': 4000, 'atlassian': 4000, 'clickup': 4000,
+    'salesforce': 5000, 'hubspot': 4000, 'airtable': 3500,
+    'zapier': 4000, 'n8n': 4000, 'pipedream': 4000,
+    'slack': 3500, 'discord': 3500, 'telegram': 3000,
+    'gmail': 3500, 'outlook': 3500, 'email': 3000,
+    'figma': 4000, 'canva': 3500, 'miro': 3500,
+    'youtube': 3000, 'twitter': 3000, 'linkedin': 3000,
+    'search': 3000, 'exa': 3000, 'tavily': 3000, 'kagi': 3000,
+    'context7': 2500, 'memory': 2000, 'supermemory': 2500,
+}
+DEFAULT_ESTIMATE = 3000
+LIGHTWEIGHT_THRESHOLD = 3000
+
+try:
+    with open('$config_path', 'r') as f:
+        d = json.load(f)
+    for key in ['mcpServers', 'mcp_servers']:
+        if key in d:
+            keep = {}
+            removed = []
+            for name, conf in d[key].items():
+                tokens = DEFAULT_ESTIMATE
+                name_lower = name.lower()
+                for keyword, cost in HEAVY_KEYWORDS.items():
+                    if keyword in name_lower:
+                        tokens = cost
+                        break
+                if tokens < LIGHTWEIGHT_THRESHOLD:
+                    keep[name] = conf
+                else:
+                    removed.append(name)
+            d[key] = keep
+            if removed:
+                print(f'    Removed {len(removed)}: {', '.join(removed)}')
+            if keep:
+                print(f'    Kept {len(keep)}: {', '.join(keep.keys())}')
+    with open('$config_path', 'w') as f:
+        json.dump(d, f, indent=2)
+except Exception as e:
+    print(f'    Warning: {e}', file=sys.stderr)
+" 2>&1
+        fi
+    done
+
+    echo ""
+    echo -e "${GREEN}Done.${NC} Heavy connectors disabled, lightweight ones preserved."
+    echo -e "  Run ${CYAN}claude-fix restore${NC} to bring everything back."
+    echo -e "  Run ${CYAN}claude-fix doctor${NC} to verify the improvement."
+    echo ""
+}
+
 # ── MAIN ────────────────────────────────────────────────────────────────────
 
 print_header
 
 case "${1:-help}" in
     status)  cmd_status ;;
+    doctor)  cmd_doctor ;;
+    slim)    cmd_slim "$@" ;;
     disable) cmd_disable ;;
     restore) cmd_restore ;;
     cache)   cmd_cache ;;
